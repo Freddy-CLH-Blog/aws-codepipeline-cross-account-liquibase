@@ -1,0 +1,392 @@
+---
+AWSTemplateFormatVersion: "2010-09-09"
+Description:
+  Deploys CodePipeline, CodeBuild and S3 artifacts bucket in the "tooling" account for the
+  CodePipeline cross-account Liquibase deployment demonstration.
+
+Parameters:
+  EnvironmentName:
+    Description: An environment name that is prefixed to resource names.
+    Type: String
+  CodeBuildComputeType:
+    Description: CodeBuild build environment type.
+    Type: String
+    Default: BUILD_GENERAL1_SMALL
+  CodeBuildImage:
+    Description: CodeBuild build environment image.
+    Type: String
+    Default: aws/codebuild/amazonlinux2-x86_64-standard:4.0
+  ConnectionArn:
+    Description: Soure repository connection ARN.
+    Type: String
+  FullRepositoryId:
+    Description: Full Repository ID e.g. "<GitHub_account>/<project_name>".
+    Type: String
+  RDSDatabaseUsername:
+    Default: postgres
+    Description: RDS Database Username.
+    Type: String
+  RDSDatabasePassword:
+    Description: RDS Database Password.
+    Type: String
+  RDSEndpoint:
+    Description: RDS Database Endpoint.
+    Type: String
+  RDSPort:
+    Description: RDS Database port.
+    Type: String
+    Default: 5432
+  SubnetIds:
+    Type: CommaDelimitedList
+    Description: List of the Subnet IDs (private) for CodeBuild to run in.
+  VpcId:
+    Description: VPC ID for CodeBuild environment.
+    Type: String
+
+Resources:
+  # =====
+  # AWS Secrets
+  # =====
+  AWSSecretsRDSCredentials:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: !Sub RDS credentials used by ${EnvironmentName} pipeline
+      Name: !Sub /${EnvironmentName}/RDS
+      SecretString: !Sub '{"DB_USER":"${RDSDatabaseUsername}","DB_PASSWORD":"${RDSDatabasePassword}"}'
+    DeletionPolicy: Delete
+
+  # =====
+  # Artifacts S3 Bucket
+  # =====
+  ArtifactsBucketKmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: For encrypting S3 objects from AWS CodePipeline artifacts.
+      Enabled: true
+      KeySpec: SYMMETRIC_DEFAULT
+      KeyUsage: ENCRYPT_DECRYPT
+      KeyPolicy:
+        Version: "2012-10-17"
+        Id: key-default-1
+        Statement:
+          - Sid: Allow direct access to the account
+            Effect: Allow
+            Action: kms:*
+            Resource: "*"
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+          - Sid:
+              Allow access through S3 for all principals in the account that are authorized
+              to use S3
+            Effect: Allow
+            Principal:
+              AWS: "*"
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: "*"
+            Condition:
+              StringEquals:
+                kms:CallerAccount: !Ref AWS::AccountId
+                kms:ViaService: !Sub s3.${AWS::Region}.amazonaws.com
+          # - Sid: CodeBuild Service in Account
+          #   Effect: Allow
+          #   Principal:
+          #     AWS: !Sub "arn:aws:iam::${AWS::AccountId}:role/${EnvironmentName}-build-role"
+          #   Action:
+          #     - kms:Encrypt
+          #     - kms:Decrypt
+          #     - kms:ReEncrypt*
+          #     - kms:GenerateDataKey*
+          #     - kms:DescribeKey
+          #   Resource: "*"
+          # - Sid: CodePipeline Service in Account
+          #   Principal:
+          #     AWS: !Sub "arn:aws:iam::${AWS::AccountId}:role/${EnvironmentName}-pipeline-role"
+          #   Effect: Allow
+          #   Action:
+          #     - kms:Encrypt
+          #     - kms:Decrypt
+          #     - kms:ReEncrypt*
+          #     - kms:GenerateDataKey*
+          #     - kms:DescribeKey
+          #   Resource: "*"
+  ArtifactsBucketKmsKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${EnvironmentName}-artifact-bucket-key"
+      TargetKeyId: !Ref ArtifactsBucketKmsKey
+  ArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${EnvironmentName}-artifact-bucket"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !GetAtt ArtifactsBucketKmsKey.Arn
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+  ArtifactsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArtifactsBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyUnEncryptedObjectUploads
+            Effect: Deny
+            Principal: "*"
+            Action: s3:PutObject
+            Resource: !Sub "arn:aws:s3:::${ArtifactsBucket}/*"
+            Condition:
+              StringNotEquals:
+                s3:x-amz-server-side-encryption: aws:kms
+          - Sid: DenyInsecureConnections
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource: !Sub "arn:aws:s3:::${ArtifactsBucket}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  # =====
+  # CodeBuild
+  # =====
+  CodeBuildIamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EnvironmentName}-build-role"
+      Path: /
+      Description: "IAM service role for AWS CodeBuild."
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodeBuildActions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: BuildLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - arn:aws:logs:*:*:log-group:/aws/codebuild/*
+                  - arn:aws:logs:*:*:log-group:/aws/codebuild/*:*
+              - Sid: ArtifactsInS3
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:GetBucketAcl
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Sub "arn:aws:s3:::${ArtifactsBucket}"
+                  - !Sub "arn:aws:s3:::${ArtifactsBucket}/*"
+              - Sid: ArtifactBucketKMSKey
+                Effect: Allow
+                Action:
+                  - kms:Encrypt
+                  - kms:Decrypt
+                  - kms:ReEncrypt*
+                  - kms:GenerateDataKey*
+                  - kms:DescribeKey
+                Resource: !GetAtt ArtifactsBucketKmsKey.Arn
+              - Sid: BuildReports
+                Effect: Allow
+                Action:
+                  - codebuild:CreateReportGroup
+                  - codebuild:CreateReport
+                  - codebuild:UpdateReport
+                  - codebuild:BatchPutTestCases
+                  - codebuild:BatchPutCodeCoverages
+                Resource: "*"
+              - Sid: GetSecrets
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref AWSSecretsRDSCredentials
+        - PolicyName: CodeBuildInVpc
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: CreateEniInVpc
+                Effect: Allow
+                Action:
+                  - ec2:CreateNetworkInterface
+                  - ec2:DescribeDhcpOptions
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DeleteNetworkInterface
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeVpcs
+                Resource: "*"
+              - Sid: CreateEniPermissionInVpc
+                Effect: Allow
+                Action:
+                  - ec2:CreateNetworkInterfacePermission
+                Resource: "*"
+
+  CodeBuildVpcSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${EnvironmentName}-build-sg"
+      GroupDescription: CodeBuild running in VPC security group.
+      VpcId: !Ref VpcId
+      # This security group by default has egress access to anywhere and no ingress rules.
+
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${EnvironmentName}-build-project"
+      Description: CodeBuild Project
+      ServiceRole: !GetAtt CodeBuildIamRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: !Ref CodeBuildComputeType
+        Image: !Ref CodeBuildImage
+      Source:
+        Type: CODEPIPELINE
+      TimeoutInMinutes: 5
+      EncryptionKey: !GetAtt ArtifactsBucketKmsKey.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref CodeBuildVpcSecurityGroup
+        Subnets: !Ref SubnetIds
+        VpcId: !Ref VpcId
+
+  # =====
+  # CodePipeline
+  # =====
+  CodePipelineIamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EnvironmentName}-pipeline-role"
+      Path: /
+      Description: "IAM service role for AWS CodePipeline."
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodePipelineActions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ArtifactsInS3
+                Effect: Allow
+                Action:
+                  - s3:Put*
+                  - s3:Get*
+                  - s3:ListBucket
+                Resource: 
+                  - !Sub "arn:aws:s3:::${ArtifactsBucket}"
+                  - !Sub "arn:aws:s3:::${ArtifactsBucket}/*"
+              - Sid: ArtifactBucketKMSKey
+                Effect: Allow
+                Action:
+                  - kms:Encrypt
+                  - kms:Decrypt
+                  - kms:ReEncrypt*
+                  - kms:GenerateDataKey*
+                  - kms:DescribeKey
+                Resource: !GetAtt ArtifactsBucketKmsKey.Arn
+              - Sid: CodeCommit
+                Effect: Allow
+                Action:
+                  - codecommit:CancelUploadArchive
+                  - codecommit:GetBranch
+                  - codecommit:GetCommit
+                  - codecommit:GetRepository
+                  - codecommit:GetUploadArchiveStatus
+                  - codecommit:UploadArchive
+                Resource: "*"
+              - Sid: CodeBuild
+                Effect: Allow
+                Action:
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuildBatches
+                  - codebuild:StartBuildBatch
+                Resource: "*"
+              - Sid: CodeDeploy
+                Effect: Allow
+                Action:
+                  - codedeploy:CreateDeployment
+                  - codedeploy:GetApplication
+                  - codedeploy:GetApplicationRevision
+                  - codedeploy:GetDeployment
+                  - codedeploy:GetDeploymentConfig
+                  - codedeploy:RegisterApplicationRevision
+                Resource: "*"
+              - Sid: CodeStarUseConnection
+                Effect: Allow
+                Action: codestar-connections:UseConnection
+                Resource: "*"
+
+  CodePipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub "${EnvironmentName}-pipeline"
+      RoleArn: !GetAtt CodePipelineIamRole.Arn
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: Source
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: "1"
+              RunOrder: 1
+              Configuration:
+                BranchName: main
+                ConnectionArn: !Ref ConnectionArn
+                FullRepositoryId: !Ref FullRepositoryId
+                OutputArtifactFormat: CODE_ZIP
+              OutputArtifacts:
+                - Name: SourceArtifact
+              InputArtifacts: []
+              Region: ap-southeast-2
+        - Name: Build
+          Actions:
+            - Name: Build
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              RunOrder: 1
+              Configuration:
+                ProjectName: !Ref CodeBuildProject
+                EnvironmentVariables: !Sub '[{"name":"DB_USER","value":"/${EnvironmentName}/RDS:DB_USER","type":"SECRETS_MANAGER"},{"name":"DB_PASSWORD","value":"/${EnvironmentName}/RDS:DB_PASSWORD","type":"SECRETS_MANAGER"},{"name":"DB_ENDPOINT","value":"${RDSEndpoint}","type":"PLAINTEXT"},{"name":"DB_PORT","value":"${RDSPort}","type":"PLAINTEXT"}]'
+              InputArtifacts:
+                - Name: SourceArtifact
+              OutputArtifacts:
+                - Name: BuildArtifact
+              Region: ap-southeast-2
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactsBucket
+        EncryptionKey:
+          Id: !Ref ArtifactsBucketKmsKey
+          Type: KMS

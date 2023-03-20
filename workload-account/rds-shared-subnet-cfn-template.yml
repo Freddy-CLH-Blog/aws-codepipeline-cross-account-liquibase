@@ -1,0 +1,325 @@
+---
+AWSTemplateFormatVersion: "2010-09-09"
+Description:
+  Deploys the RDS PostgreSQL database, shared subnet, and required VPC resources in the "workload"
+  account for the CodePipeline cross-account Liquibase deployment demonstration.
+
+Parameters:
+  EnvironmentName:
+    Description: An environment name that is prefixed to resource names.
+    Type: String
+  ToolingAccountId:
+    Description: Tooling Account ID in which to share resources with.
+    Type: String
+  VpcCIDR:
+    Description: VPC IP range (CIDR notation).
+    Type: String
+    Default: 10.192.0.0/16
+  PublicSubnet1CIDR:
+    Description: Public subnet IP range (CIDR notation).
+    Type: String
+    Default: 10.192.10.0/24
+  PrivateDBSubnet1CIDR:
+    Description: Private database subnet in the first Availability Zone IP range (CIDR notation).
+    Type: String
+    Default: 10.192.20.0/24
+  PrivateDBSubnet2CIDR:
+    Description: Private database subnet in the second Availability Zone IP range (CIDR notation).
+    Type: String
+    Default: 10.192.21.0/24
+  PrivateSharedSubnet1CIDR:
+    Description: Private shared subnet IP range (CIDR notation).
+    Type: String
+    Default: 10.192.30.0/24
+  RDSDatabaseUsername:
+    Default: postgres
+    Description: RDS Database Username.
+    Type: String
+  RDSDatabasePassword:
+    Description: RDS Database Password.
+    Type: String
+  RDSPostgresEngineVersion:
+    Description: RDS PostgreSQL database engine version to use.
+    Type: String
+    Default: "14.5"
+
+Resources:
+  # =====
+  # VPC
+  # =====
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCIDR
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Ref EnvironmentName
+  
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Ref EnvironmentName
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+  
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+      CidrBlock: !Ref PublicSubnet1CIDR
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} Public Subnet (AZ1)
+  PrivateDBSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 0, !GetAZs  '' ]
+      CidrBlock: !Ref PrivateDBSubnet1CIDR
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} Database Private Subnet (AZ1)
+  PrivateDBSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 1, !GetAZs  '' ]
+      CidrBlock: !Ref PrivateDBSubnet2CIDR
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} Database Private Subnet (AZ2)
+  PrivateSharedSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 0, !GetAZs  '' ]
+      CidrBlock: !Ref PrivateSharedSubnet1CIDR
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} Shared Private Subnet (AZ1)
+
+  NatGateway1EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+  NatGateway1:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGateway1EIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} Public Routes
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet1
+  PrivateSharedRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} Shared Private Subnet Routes (AZ1)
+  DefaultPrivateSharedRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateSharedRouteTable1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway1
+  PrivateSharedSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateSharedRouteTable1
+      SubnetId: !Ref PrivateSharedSubnet1
+
+  # =====
+  # AWS Secrets
+  # =====
+  AWSSecretsRDSCredentials:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: !Sub ${EnvironmentName} RDS credentials
+      Name: !Sub /${EnvironmentName}/RDS
+      SecretString: !Sub '{"USERNAME":"${RDSDatabaseUsername}","PASSWORD":"${RDSDatabasePassword}"}'
+    DeletionPolicy: Delete
+  
+  # =====
+  # RDS
+  # =====
+  RDSSecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties: 
+      GroupName: !Sub ${EnvironmentName}-RDS-SecurityGroup
+      GroupDescription: !Sub ${EnvironmentName}-SecurityGroup for RDS
+      SecurityGroupIngress: 
+        - CidrIp: !Ref VpcCIDR
+          FromPort: 5432
+          IpProtocol: tcp
+          ToPort: 5432
+      VpcId: !Ref 'VPC'
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-RDS-SecurityGroup
+  RDSSubnetGroup:
+    Type: "AWS::RDS::DBSubnetGroup"
+    Properties:
+      DBSubnetGroupName: !Sub ${EnvironmentName}-RDS-SubnetGroup
+      DBSubnetGroupDescription: !Sub ${EnvironmentName}-SubnetGroup for RDS
+      SubnetIds: 
+        - !Ref PrivateDBSubnet1
+        - !Ref PrivateDBSubnet2
+      Tags: 
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-RDS-SubnetGroup
+  RDSInstance:
+    Type: "AWS::RDS::DBInstance"
+    Properties:
+      AllocatedStorage: 20
+      AutoMinorVersionUpgrade: true
+      BackupRetentionPeriod: 1
+      CopyTagsToSnapshot: true
+      DBInstanceClass: db.t4g.micro
+      DBInstanceIdentifier: !Sub ${EnvironmentName}-RDS-postgres
+      Engine: postgres
+      EngineVersion: !Ref RDSPostgresEngineVersion
+      DBSubnetGroupName: !Ref RDSSubnetGroup
+      VPCSecurityGroups: 
+      - !GetAtt RDSSecurityGroup.GroupId
+      MasterUsername: !Sub ${RDSDatabaseUsername}
+      MasterUserPassword: !Sub ${RDSDatabasePassword}
+      MonitoringInterval: 0
+      PubliclyAccessible: false
+      StorageType: gp2
+    DeletionPolicy: Delete
+
+  # =====
+  # EC2 Tester Launch Template
+  # =====
+  EC2TesterIamRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: !Sub ${EnvironmentName}-ec2-tester-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+  EC2TesterInstanceProfile:
+    Type: "AWS::IAM::InstanceProfile"
+    Properties:
+      Roles:
+        - !Ref EC2TesterIamRole
+  EC2TesterSecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties: 
+      GroupName: !Sub ${EnvironmentName}-EC2-Tester-SecurityGroup
+      GroupDescription: !Sub ${EnvironmentName} EC2 Tester Security Group
+      SecurityGroupEgress: 
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: '-1' 
+      VpcId: !Ref 'VPC'
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-EC2-Tester-SecurityGroup
+
+  EC2TesterLaunchTemplate:
+    Type: "AWS::EC2::LaunchTemplate"
+    Properties:
+      LaunchTemplateData:
+        IamInstanceProfile:
+          Arn: !GetAtt EC2TesterInstanceProfile.Arn
+        NetworkInterfaces:
+          - AssociatePublicIpAddress: false
+            DeviceIndex: 0
+            Groups:
+              - !Ref EC2TesterSecurityGroup
+            SubnetId: !Ref PrivateSharedSubnet1
+        InstanceType: t2.micro
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub ${EnvironmentName}-EC2-Tester
+          - ResourceType: volume
+            Tags:
+              - Key: Name
+                Value: !Sub ${EnvironmentName}-EC2-Tester
+          - ResourceType: network-interface
+            Tags:
+              - Key: Name
+                Value: !Sub ${EnvironmentName}-EC2-Tester
+
+  # =====
+  # Resource Access Manager
+  # =====
+  ResourceShare:
+    Type: "AWS::RAM::ResourceShare"
+    Properties:
+      Name: !Sub ${EnvironmentName}-resource-share
+      AllowExternalPrincipals: false
+      ResourceArns:
+        - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:subnet/${PrivateSharedSubnet1}
+      Principals:
+        - !Ref ToolingAccountId
+      # PermissionArns:  # When not specified, the default permissions are used
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-resource-share
+
+Outputs:
+  VPCId:
+    Description: VPC ID containing the shared subnet.
+    Value: !Ref VPC
+
+  SharedSubnetId:
+    Description: Shared Subnet ID
+    Value: !Ref PrivateSharedSubnet1
+  
+  SharedSubnetArn:
+    Description: Shared Subnet ARN
+    Value: !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:subnet/${PrivateSharedSubnet1}
+
+  RDSEndpointAddress:
+    Description: RDS endpoint address
+    Value: !GetAtt RDSInstance.Endpoint.Address
+  
+  RDSEndpointPort:
+    Description: RDS endpoint port
+    Value: !GetAtt RDSInstance.Endpoint.Port
+
+  EC2TesterLaunchTemplateId:
+    Description: EC2 tester Launch Template ID
+    Value: !Ref EC2TesterLaunchTemplate
