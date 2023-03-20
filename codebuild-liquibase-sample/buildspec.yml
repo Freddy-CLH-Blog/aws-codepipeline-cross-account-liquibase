@@ -1,0 +1,28 @@
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      java: latest
+    commands:
+      - echo "Installing Liquibase..."
+      - curl -LJO https://github.com/liquibase/liquibase/releases/download/v4.18.0/liquibase-4.18.0.tar.gz
+      - mkdir liquibase
+      - tar -xzf liquibase-4.18.0.tar.gz -C liquibase
+      - liquibase/liquibase --version
+  build:
+    commands:
+      - echo "Configuring liquibase.properties..."
+      - sed -i "s|<DB_ENDPOINT>|$DB_ENDPOINT|g" liquibase.properties
+      - sed -i "s|<DB_PORT>|$DB_PORT|g" liquibase.properties
+      - sed -i "s|<DB_USER>|$DB_USER|g" liquibase.properties
+      - sed -i "s|<DB_PASSWORD>|$DB_PASSWORD|g" liquibase.properties
+      - echo "Checking Liquibase status and update SQL..."
+      - liquibase/liquibase --changelog-file=changelog.sql status
+      - liquibase/liquibase --changelog-file=changelog.sql update-sql
+      - echo "Performing Liquibase update..."
+      - liquibase/liquibase --changelog-file=changelog.sql update
+  post_build:
+    commands:
+      - echo Build completed on `date`
+
